@@ -1,0 +1,729 @@
+import { useState, useEffect, useRef } from 'react'
+import { Canvas } from '@react-three/fiber'
+import { OrbitControls, Grid, Line, Text } from '@react-three/drei'
+import * as THREE from 'three'
+
+// Small inline icon components (no external icon package required)
+function SunIcon({ size = 16, color = 'currentColor' }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="4" />
+      <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" />
+    </svg>
+  )
+}
+function MoonIcon({ size = 16, color = 'currentColor' }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M21 12.79A9 9 0 1 1 11.21 3a7 7 0 0 0 9.79 9.79z" />
+    </svg>
+  )
+}
+function BookOpenIcon({ size = 16, color = 'currentColor' }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z" />
+      <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" />
+    </svg>
+  )
+}
+function RefreshIcon({ size = 16, color = 'currentColor' }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M21 2v6h-6M3 22v-6h6" />
+      <path d="M3.51 9a9 9 0 0 1 14.85-3.36L21 8M20.49 15a9 9 0 0 1-14.85 3.36L3 16" />
+    </svg>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// THEME TOKENS
+// Dark mode keeps the original near-black studio look with a warm
+// yellow/orange grid. Light mode swaps to a paper-white workspace with a
+// neutral grey grid, so the geometry itself stays the readable focal point
+// in either mode.
+// ---------------------------------------------------------------------------
+const THEMES = {
+  dark: {
+    appBg: '#1b1b1b',
+    panelBg: '#2b2b2b',
+    stripBg: '#202020',
+    border: '#3c3c3c',
+    text: '#ffffff',
+    textMuted: '#aaa',
+    textFaint: '#666',
+    textDim: '#555',
+    inputBg: 'transparent',
+    toggleTrack: '#111',
+    toggleActive: '#555',
+    sceneBg: '#1b1b1b',
+    gridCell: '#7a4a12',
+    gridSection: '#f59e0b',
+  },
+  light: {
+    appBg: '#f4f4f2',
+    panelBg: '#ffffff',
+    stripBg: '#ececea',
+    border: '#dcdcd8',
+    text: '#1c1c1c',
+    textMuted: '#5a5a5a',
+    textFaint: '#8a8a8a',
+    textDim: '#9a9a9a',
+    inputBg: 'transparent',
+    toggleTrack: '#e2e2df',
+    toggleActive: '#c7c7c2',
+    sceneBg: '#f4f4f2',
+    gridCell: '#c9c9c5',
+    gridSection: '#8a8a86',
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Plain-array vector math helpers (kept dependency-free and easy to read
+// alongside the existing manual cross-product code in this file)
+// ---------------------------------------------------------------------------
+const vAdd = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+const vSub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+const vScale = (a, s) => [a[0] * s, a[1] * s, a[2] * s]
+const vDot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+const vCross = (a, b) => [
+  a[1] * b[2] - a[2] * b[1],
+  a[2] * b[0] - a[0] * b[2],
+  a[0] * b[1] - a[1] * b[0]
+]
+const vLen = (a) => Math.sqrt(vDot(a, a))
+
+// ---------------------------------------------------------------------------
+// A-level style vector notation: turns [2, -3, 1] into "2i - 3j + k"
+// ---------------------------------------------------------------------------
+function ijk(vec, dp = 2) {
+  const labels = ['i', 'j', 'k']
+  const round = (v) => {
+    const r = Number(v.toFixed(dp))
+    return Object.is(r, -0) ? 0 : r
+  }
+  const parts = vec.map((v, idx) => {
+    const r = round(v)
+    if (Math.abs(r) < 1e-9) return null
+    const abs = Math.abs(r)
+    const coeff = Math.abs(abs - 1) < 1e-9 ? '' : (Number.isInteger(abs) ? abs.toString() : abs.toFixed(dp))
+    return (r < 0 ? '-' : '') + coeff + labels[idx]
+  }).filter(Boolean)
+  if (parts.length === 0) return '0'
+  let str = parts[0]
+  for (let k = 1; k < parts.length; k++) {
+    str += parts[k].startsWith('-') ? ` - ${parts[k].slice(1)}` : ` + ${parts[k]}`
+  }
+  return str
+}
+
+// Full vector equation of a line: r = a + λb  (drops the "a +" term when the
+// line passes through the origin, as A-level answers usually do)
+function vectorLineEquation(point, dir) {
+  const throughOrigin = vLen(point) < 1e-6
+  return throughOrigin
+    ? `r = λ(${ijk(dir)})`
+    : `r = (${ijk(point)}) + λ(${ijk(dir)})`
+}
+
+// Cartesian y = mx + c fallback — only meaningful for a genuinely 2D line
+// (z = 0 throughout), shown alongside the vector form when in 2D mode.
+function cartesian2D(point, dir) {
+  const [px, py] = point
+  const [dx, dy] = dir
+  if (Math.abs(dx) < 1e-9) return `x = ${px.toFixed(2)}`
+  const m = dy / dx
+  const c = py - m * px
+  const mStr = Math.abs(m - 1) < 1e-9 ? '' : (Math.abs(m + 1) < 1e-9 ? '-' : m.toFixed(2))
+  const cStr = Math.abs(c) < 1e-9 ? '' : (c > 0 ? ` + ${c.toFixed(2)}` : ` - ${Math.abs(c).toFixed(2)}`)
+  return `y = ${mStr}x${cStr}`
+}
+
+// Two planes here always pass through the origin (they're spanned by two
+// vectors), so their line of intersection always passes through the origin
+// too — direction is simply the cross product of the two normals.
+function intersectPlanePlane(n1, n2) {
+  const dir = vCross(n1, n2)
+  if (vLen(dir) < 1e-6) return null // parallel planes, no line of intersection
+  return { kind: 'line', point: [0, 0, 0], dir }
+}
+
+// Line-line intersection in 3D: only true if the lines are coplanar and not
+// parallel. Skew lines (common in 3D) correctly report "no intersection".
+function intersectLineLine(L1, L2) {
+  const { point: p1, dir: d1 } = L1
+  const { point: p2, dir: d2 } = L2
+  const n = vCross(d1, d2)
+  const nLen = vLen(n)
+  if (nLen < 1e-6) return null // parallel or identical direction
+  const diff = vSub(p2, p1)
+  const planarity = vDot(diff, n)
+  if (Math.abs(planarity) > 1e-3) return null // skew, never meet
+  const t = vDot(vCross(diff, d2), n) / (nLen * nLen)
+  return { kind: 'point', point: vAdd(p1, vScale(d1, t)) }
+}
+
+// Line-plane intersection (plane through origin with given normal).
+function intersectLinePlane(line, normal) {
+  const denom = vDot(line.dir, normal)
+  if (Math.abs(denom) < 1e-6) return null // line runs parallel to the plane
+  const t = -vDot(line.point, normal) / denom
+  return { kind: 'point', point: vAdd(line.point, vScale(line.dir, t)) }
+}
+
+// Clean Vector Arrow Component
+function VectorArrow({ start = [0, 0, 0], end, color, visible = true }) {
+  const arrowRef = useRef()
+  useEffect(() => {
+    if (arrowRef.current && visible && end) {
+      const pStart = new THREE.Vector3(...start)
+      const pEnd = new THREE.Vector3(...end)
+      const direction = new THREE.Vector3().subVectors(pEnd, pStart)
+      const length = direction.length()
+      arrowRef.current.position.copy(pStart)
+      if (length > 0) {
+        arrowRef.current.setDirection(direction.normalize())
+        arrowRef.current.setLength(length)
+      } else {
+        arrowRef.current.setLength(0.01)
+      }
+    }
+  }, [start, end, visible])
+
+  if (!visible || !end) return null
+  return <primitive ref={arrowRef} object={new THREE.ArrowHelper(new THREE.Vector3(0,1,0), new THREE.Vector3(0,0,0), 1, color, 0.25, 0.12)} />
+}
+
+// Spanned Plane Component
+function SpannedPlane({ vec1, vec2, color, visible = true }) {
+  const meshRef = useRef()
+  useEffect(() => {
+    if (meshRef.current && visible && vec1 && vec2) {
+      const v1 = new THREE.Vector3(...vec1)
+      const v2 = new THREE.Vector3(...vec2)
+      const normal = new THREE.Vector3().crossVectors(v1, v2).normalize()
+      const up = new THREE.Vector3(0, 1, 0)
+      const quaternion = new THREE.Quaternion().setFromUnitVectors(up, normal)
+      meshRef.current.quaternion.copy(quaternion)
+    }
+  }, [vec1, vec2, visible])
+
+  if (!visible || !vec1 || !vec2) return null
+  return (
+    <mesh ref={meshRef} rotation={[Math.PI / 2, 0, 0]}>
+      <planeGeometry args={[15, 15]} />
+      <meshBasicMaterial color={color} side={THREE.DoubleSide} transparent opacity={0.15} wireframe={false} />
+    </mesh>
+  )
+}
+
+// A line drawn through `point` along `dir`, extended both directions so it
+// reads as "infinite" like a Desmos line, used for both plain line(P, Q)
+// definitions and plane∩plane intersection results.
+function InfiniteLine({ point, dir, color, visible = true, length = 12 }) {
+  if (!visible || !point || !dir) return null
+  const d = new THREE.Vector3(...dir)
+  if (d.length() < 1e-6) return null
+  d.normalize()
+  const p = new THREE.Vector3(...point)
+  const a = p.clone().addScaledVector(d, -length)
+  const b = p.clone().addScaledVector(d, length)
+  return <Line points={[[a.x, a.y, a.z], [b.x, b.y, b.z]]} color={color} lineWidth={2} />
+}
+
+// A small glowing marker for a computed intersection point (line∩line or
+// line∩plane), so it reads visually distinct from a vector tip.
+function IntersectionPoint({ point, color, visible = true }) {
+  if (!visible || !point) return null
+  return (
+    <mesh position={point}>
+      <sphereGeometry args={[0.13, 20, 20]} />
+      <meshStandardMaterial color={color} emissive={color} emissiveIntensity={0.6} />
+    </mesh>
+  )
+}
+
+// Floating text label used to tag vectors, lines, and intersection results
+// directly in the scene, the way Desmos labels its points and lines.
+function SceneLabel({ position, text, color }) {
+  if (!position || !text) return null
+  return (
+    <Text
+      position={[position[0] + 0.18, position[1] + 0.18, position[2] + 0.18]}
+      fontSize={0.28}
+      color={color}
+      anchorX="left"
+      anchorY="bottom"
+      outlineWidth={0.008}
+      outlineColor="#000000"
+    >
+      {text}
+    </Text>
+  )
+}
+
+const DEFAULT_EXPRESSIONS = [
+  { id: '1', text: 'a = 2.0', visible: true, color: '#3b82f6' },
+  { id: '2', text: 'b = -1.5', visible: true, color: '#ef4444' },
+  { id: '3', text: 'u = [a, 3, 1]', visible: true, color: '#3b82f6' },
+  { id: '4', text: 'v = [3, b, 2]', visible: true, color: '#ef4444' },
+  { id: '5', text: 'cross(u, v)', visible: true, color: '#a855f7' },
+  { id: '6', text: 'plane(u, v)', visible: true, color: '#eab308' },
+  { id: '7', text: 'dot(u, v)', visible: true, color: '#10b981' },
+  { id: '8', text: 'w = [1, -2, 2]', visible: true, color: '#f97316' },
+  { id: '9', text: 'p1 = plane(u, v)', visible: true, color: '#06b6d4' },
+  { id: '10', text: 'p2 = plane(v, w)', visible: true, color: '#ec4899' },
+  { id: '11', text: 'intersect(p1, p2)', visible: true, color: '#f43f5e' },
+  { id: '12', text: 'angle(u, v)', visible: true, color: '#84cc16' }
+]
+
+export default function App() {
+  const [dimensions, setDimensions] = useState('3D')
+
+  // Light / Dark theme toggle. Defaults to dark to preserve the original look.
+  const [mode, setMode] = useState('dark')
+  const t = THEMES[mode]
+
+  // Lessons & practice redirect target. Point this at wherever you host your
+  // uploaded lesson material (a Notion page, a docs site, a folder, etc).
+  const LESSONS_URL = 'https://drive.google.com/drive/folders/1PSGa9dZBOmRAS9Z86NVNDPxbxPaEb3nA?usp=sharing'
+
+  // Desmos Initial Expression List State
+  const [expressions, setExpressions] = useState(DEFAULT_EXPRESSIONS)
+
+  // Real-time Parser Outputs
+  const [environment, setEnvironment] = useState({
+    variables: {},
+    vectors: {},
+    planes: {},
+    lines: {},
+    renders: []
+  })
+
+  // Live Core Evaluation Engine Loop
+  useEffect(() => {
+    const vars = {}
+    const vecs = {}
+    const planes = {}
+    const lines = {}
+    const visualRenders = []
+
+    expressions.forEach((exp) => {
+      const input = exp.text.replace(/\s+/g, '') // strip whitespace
+      exp.computedValue = undefined
+      if (!input) return
+
+      // Helper function to resolve string variables/numbers to pure floats
+      const resolveValue = (str) => {
+        if (vars[str] !== undefined) return vars[str]
+        return parseFloat(str) || 0
+      }
+
+      // 1. Parse Sliders/Variables (e.g., a = 2.5)
+      const varMatch = input.match(/^([a-zA-Z0-9]+)=([-\d.]+)$/)
+      if (varMatch) {
+        vars[varMatch[1]] = parseFloat(varMatch[2])
+        return
+      }
+
+      // 2. Parse Vectors (e.g., u = [a, 2, 3])
+      const vecMatch = input.match(/^([a-zA-Z0-9]+)=\[([^\]]+)\]$/)
+      if (vecMatch) {
+        const components = vecMatch[2].split(',').map(resolveValue)
+        // Ensure 3 components padded with zero for 2D safety
+        while (components.length < 3) components.push(0)
+        if (dimensions === '2D') components[2] = 0 // Enforce zero depth layout lock
+        vecs[vecMatch[1]] = components
+
+        visualRenders.push({
+          id: exp.id,
+          type: 'vector',
+          name: vecMatch[1],
+          coords: components,
+          color: exp.color,
+          visible: exp.visible,
+          meta: `|${vecMatch[1]}| = ${vLen(components).toFixed(2)}`
+        })
+        return
+      }
+
+      // 3. Named Plane: p1 = plane(u, v) — stored so it can be referenced
+      // later by intersect(p1, p2). Renders exactly like the unnamed
+      // plane(u, v) call below.
+      const namedPlaneMatch = input.match(/^([a-zA-Z0-9]+)=plane\(([a-zA-Z0-9]+),([a-zA-Z0-9]+)\)$/)
+      if (namedPlaneMatch) {
+        const u = vecs[namedPlaneMatch[2]]
+        const v = vecs[namedPlaneMatch[3]]
+        if (u && v) {
+          planes[namedPlaneMatch[1]] = { normal: vCross(u, v) }
+          visualRenders.push({
+            id: exp.id, type: 'plane', vec1: u, vec2: v,
+            color: exp.color, visible: exp.visible
+          })
+        }
+        return
+      }
+
+      // 4. Named Line through two points: L1 = line(P, Q). P and Q are
+      // vectors used as position vectors of two points; the line passes
+      // through both.
+      const namedLineMatch = input.match(/^([a-zA-Z0-9]+)=line\(([a-zA-Z0-9]+),([a-zA-Z0-9]+)\)$/)
+      if (namedLineMatch) {
+        const P = vecs[namedLineMatch[2]]
+        const Q = vecs[namedLineMatch[3]]
+        if (P && Q) {
+          const dir = vSub(Q, P)
+          lines[namedLineMatch[1]] = { point: P, dir }
+          visualRenders.push({
+            id: exp.id, type: 'line', point: P, dir,
+            color: exp.color, visible: exp.visible, name: namedLineMatch[1],
+            meta: vectorLineEquation(P, dir)
+          })
+        }
+        return
+      }
+
+      // 5. intersect(A, B) — auto-detects plane∩plane (→ line), line∩line
+      // (→ point, only if they actually meet), or line∩plane (→ point).
+      const intersectMatch = input.match(/^intersect\(([a-zA-Z0-9]+),([a-zA-Z0-9]+)\)$/)
+      if (intersectMatch) {
+        const [nameA, nameB] = [intersectMatch[1], intersectMatch[2]]
+        let result = null
+        let situation = ''
+
+        if (planes[nameA] && planes[nameB]) {
+          result = intersectPlanePlane(planes[nameA].normal, planes[nameB].normal)
+          situation = 'planes'
+        } else if (lines[nameA] && lines[nameB]) {
+          result = intersectLineLine(lines[nameA], lines[nameB])
+          situation = 'lines'
+        } else if (planes[nameA] && lines[nameB]) {
+          result = intersectLinePlane(lines[nameB], planes[nameA].normal)
+          situation = 'line-plane'
+        } else if (planes[nameB] && lines[nameA]) {
+          result = intersectLinePlane(lines[nameA], planes[nameB].normal)
+          situation = 'line-plane'
+        }
+
+        if (result?.kind === 'line') {
+          visualRenders.push({ id: exp.id, type: 'intersectionLine', point: result.point, dir: result.dir, color: exp.color, visible: exp.visible })
+          let form = `Line of intersection:\n${vectorLineEquation(result.point, result.dir)}`
+          if (dimensions === '2D') form += `\n${cartesian2D(result.point, result.dir)}`
+          exp.computedValue = form
+        } else if (result?.kind === 'point') {
+          visualRenders.push({ id: exp.id, type: 'intersectionPoint', point: result.point, color: exp.color, visible: exp.visible })
+          exp.computedValue = `Point of intersection:\n(${result.point.map(c => c.toFixed(2)).join(', ')})  =  ${ijk(result.point)}`
+        } else if (situation === 'planes') {
+          exp.computedValue = 'Planes are parallel — no line of intersection'
+        } else if (situation === 'lines') {
+          exp.computedValue = 'Lines are parallel or skew — no intersection'
+        } else if (situation === 'line-plane') {
+          exp.computedValue = 'Line runs parallel to the plane — no intersection'
+        } else {
+          exp.computedValue = 'Define two named planes/lines first, e.g. p1 = plane(u, v)'
+        }
+        return
+      }
+
+      // 6. angle(u, v) — angle between two vectors in degrees
+      const angleMatch = input.match(/^angle\(([a-zA-Z0-9]+),([a-zA-Z0-9]+)\)$/)
+      if (angleMatch) {
+        const u = vecs[angleMatch[1]]
+        const v = vecs[angleMatch[2]]
+        if (u && v) {
+          const lu = vLen(u), lv = vLen(v)
+          if (lu > 1e-9 && lv > 1e-9) {
+            const cosT = Math.min(1, Math.max(-1, vDot(u, v) / (lu * lv)))
+            exp.computedValue = `θ = ${(Math.acos(cosT) * 180 / Math.PI).toFixed(1)}°`
+          }
+        }
+        return
+      }
+
+      // 7. Parse Operations: cross(u, v)
+      const crossMatch = input.match(/^cross\(([a-zA-Z0-9]+),([a-zA-Z0-9]+)\)$/)
+      if (crossMatch) {
+        const u = vecs[crossMatch[1]]
+        const v = vecs[crossMatch[2]]
+        if (u && v) {
+          const cross = vCross(u, v)
+          visualRenders.push({
+            id: exp.id,
+            type: 'vector',
+            name: `cross(${crossMatch[1]}, ${crossMatch[2]})`,
+            coords: cross,
+            color: exp.color,
+            visible: exp.visible,
+            meta: `Result: [${cross.map(c => c.toFixed(1)).join(', ')}]  =  ${ijk(cross)}`
+          })
+        }
+        return
+      }
+
+      // 8. Parse Operations: plane(u, v)  (unnamed — can't be intersected)
+      const planeMatch = input.match(/^plane\(([a-zA-Z0-9]+),([a-zA-Z0-9]+)\)$/)
+      if (planeMatch) {
+        const u = vecs[planeMatch[1]]
+        const v = vecs[planeMatch[2]]
+        if (u && v) {
+          visualRenders.push({
+            id: exp.id,
+            type: 'plane',
+            vec1: u,
+            vec2: v,
+            color: exp.color,
+            visible: exp.visible
+          })
+        }
+        return
+      }
+
+      // 9. Parse Operations: dot(u, v)
+      const dotMatch = input.match(/^dot\(([a-zA-Z0-9]+),([a-zA-Z0-9]+)\)$/)
+      if (dotMatch) {
+        const u = vecs[dotMatch[1]]
+        const v = vecs[dotMatch[2]]
+        if (u && v) {
+          const dot = vDot(u, v)
+          exp.computedValue = `Result = ${dot.toFixed(2)}`
+        }
+        return
+      }
+    })
+
+    setEnvironment({ variables: vars, vectors: vecs, planes, lines, renders: visualRenders })
+  }, [expressions, dimensions])
+
+  // Add line block
+  const addExpression = () => {
+    const colors = ['#3b82f6', '#ef4444', '#10b981', '#a855f7', '#eab308']
+    const randomColor = colors[expressions.length % colors.length]
+    setExpressions([...expressions, { id: Date.now().toString(), text: '', visible: true, color: randomColor }])
+  }
+
+  // Restore the original demo set — handy after experimenting or deleting rows
+  const resetExpressions = () => {
+    setExpressions(DEFAULT_EXPRESSIONS.map(e => ({ ...e })))
+  }
+
+  // Update string text line
+  const updateText = (id, text) => {
+    setExpressions(expressions.map(e => e.id === id ? { ...e, text } : e))
+  }
+
+  // Handle active value slide
+  const updateSlider = (varName, val) => {
+    setExpressions(expressions.map(e => {
+      const clean = e.text.replace(/\s+/g, '')
+      if (clean.startsWith(`${varName}=`)) {
+        return { ...e, text: `${varName} = ${val}` }
+      }
+      return e
+    }))
+  }
+
+  // Toggle visual bubble logic
+  const toggleVisibility = (id) => {
+    setExpressions(expressions.map(e => e.id === id ? { ...e, visible: !e.visible } : e))
+  }
+
+  // Delete line item
+  const deleteExpression = (id) => {
+    setExpressions(expressions.filter(e => e.id !== id))
+  }
+
+  // Open the lessons / practice material destination in a new tab
+  const openLessons = () => {
+    window.open(LESSONS_URL, '_blank', 'noopener,noreferrer')
+  }
+
+  return (
+    <div style={{ display: 'flex', width: '100vw', height: '100vh', backgroundColor: t.appBg, color: t.text, fontFamily: 'system-ui, -apple-system, sans-serif', transition: 'background-color 0.2s ease, color 0.2s ease' }}>
+
+      {/* LEFT MATRIC DISK PANEL: Absolute Desmos Clone Layout */}
+      <div style={{ width: '460px', backgroundColor: t.panelBg, borderRight: `1px solid ${t.border}`, display: 'flex', flexDirection: 'column', height: '100%' }}>
+
+        {/* Desmos Menu Control Strip */}
+        <div style={{ padding: '15px 20px', backgroundColor: t.stripBg, borderBottom: `1px solid ${t.border}`, display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 }}>
+            <button onClick={addExpression} style={{ background: t.border, border: 'none', color: t.text, width: '32px', height: '32px', borderRadius: '4px', fontSize: '20px', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 'bold', flexShrink: 0 }}>+</button>
+            <button onClick={resetExpressions} title="Reset to example set" style={{ background: t.border, border: 'none', color: t.text, width: '32px', height: '32px', borderRadius: '4px', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+              <RefreshIcon size={15} />
+            </button>
+            <span style={{ fontWeight: '600', letterSpacing: '0.5px', fontSize: '15px', color: t.textMuted, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>VECTOR STUDIO</span>
+          </div>
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0 }}>
+            {/* Lessons & Practice Material shortcut */}
+            <button
+              onClick={openLessons}
+              title="Vector lessons & practice material"
+              style={{ border: 'none', background: t.toggleTrack, color: t.text, width: '32px', height: '32px', borderRadius: '6px', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+            >
+              <BookOpenIcon size={16} />
+            </button>
+
+            {/* Light / Dark theme toggle */}
+            <button
+              onClick={() => setMode(mode === 'dark' ? 'light' : 'dark')}
+              title="Toggle light / dark theme"
+              style={{ border: 'none', background: t.toggleTrack, color: t.text, width: '32px', height: '32px', borderRadius: '6px', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+            >
+              {mode === 'dark' ? <SunIcon size={16} /> : <MoonIcon size={16} />}
+            </button>
+
+            <div style={{ display: 'flex', gap: '2px', backgroundColor: t.toggleTrack, padding: '3px', borderRadius: '6px' }}>
+              <button onClick={() => setDimensions('2D')} style={{ border: 'none', background: dimensions === '2D' ? t.toggleActive : 'transparent', color: t.text, padding: '5px 10px', borderRadius: '4px', fontSize: '12px', cursor: 'pointer', fontWeight: 'bold' }}>2D</button>
+              <button onClick={() => setDimensions('3D')} style={{ border: 'none', background: dimensions === '3D' ? t.toggleActive : 'transparent', color: t.text, padding: '5px 10px', borderRadius: '4px', fontSize: '12px', cursor: 'pointer', fontWeight: 'bold' }}>3D</button>
+            </div>
+          </div>
+        </div>
+
+        {/* The Expression Row List Stack */}
+        <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column' }}>
+          {expressions.map((exp, index) => {
+            const cleanText = exp.text.replace(/\s+/g, '')
+            const isVariable = cleanText.match(/^([a-zA-Z0-9]+)=([-\d.]+)$/)
+            const varName = isVariable ? isVariable[1] : null
+            const varVal = isVariable ? parseFloat(isVariable[2]) : 0
+            const rowMeta = environment.renders.find(r => r.id === exp.id)?.meta
+
+            return (
+              <div key={exp.id} style={{ display: 'flex', padding: '12px 15px', borderBottom: `1px solid ${t.border}`, alignItems: 'flex-start', gap: '12px', position: 'relative', backgroundColor: t.panelBg }}>
+
+                {/* Desmos Row Index Number */}
+                <span style={{ fontSize: '12px', color: t.textFaint, marginTop: '8px', width: '15px', textAlign: 'right' }}>{index + 1}</span>
+
+                {/* Desmos Interactive Colored Visibility Bubble */}
+                <button
+                  onClick={() => toggleVisibility(exp.id)}
+                  style={{
+                    width: '24px', height: '24px', borderRadius: '50%', marginTop: '4px', border: `2px solid ${exp.color}`,
+                    background: exp.visible ? exp.color : 'transparent', cursor: 'pointer', transition: 'background 0.1s',
+                    boxShadow: exp.visible ? `0 0 6px ${exp.color}80` : 'none'
+                  }}
+                />
+
+                {/* Command Expression Text Input Container */}
+                <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                  <input
+                    type="text" value={exp.text} onChange={(e) => updateText(exp.id, e.target.value)}
+                    placeholder="Type expression (e.g., u = [1, 2, 3])"
+                    style={{ width: '100%', background: t.inputBg, border: 'none', outline: 'none', color: t.text, fontSize: '16px', fontFamily: 'monospace', padding: '4px 0' }}
+                  />
+
+                  {/* Render Sliders automatically under variables just like Desmos */}
+                  {isVariable && (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginTop: '4px' }}>
+                      <input
+                        type="range" min="-5" max="5" step="0.1" value={varVal}
+                        onChange={(e) => updateSlider(varName, parseFloat(e.target.value))}
+                        style={{ flex: 1, accentColor: exp.color }}
+                      />
+                    </div>
+                  )}
+
+                  {/* Unified readout: vector magnitudes, cross-product results,
+                      dot products, angles, and intersection results all surface here */}
+                  {rowMeta && (
+                    <span style={{ fontSize: '13px', color: t.textMuted, fontFamily: 'monospace' }}>
+                      {rowMeta}
+                    </span>
+                  )}
+                  {exp.computedValue && (
+                    <span style={{ fontSize: '13px', color: '#fbbf24', fontFamily: 'monospace', fontWeight: 'bold', whiteSpace: 'pre-line' }}>
+                      {exp.computedValue}
+                    </span>
+                  )}
+                </div>
+
+                {/* Delete button option */}
+                <button onClick={() => deleteExpression(exp.id)} style={{ background: 'transparent', border: 'none', color: t.textDim, cursor: 'pointer', fontSize: '16px', marginTop: '4px' }}>✕</button>
+              </div>
+            )
+          })}
+        </div>
+
+        {/* Quick Commands Guide Bar at bottom */}
+        <div style={{ padding: '15px 20px', backgroundColor: t.stripBg, borderTop: `1px solid ${t.border}`, fontSize: '12px', color: t.textMuted, fontFamily: 'monospace', lineHeight: '1.5' }}>
+          <strong style={{ color: t.text }}>KEY COMMANDS SYNTAX:</strong><br />
+          • Slider Variable: <span style={{ color: '#eab308' }}>a = 2.0</span><br />
+          • 3D Vector Layout: <span style={{ color: '#3b82f6' }}>u = [a, 3, 1]</span><br />
+          • Core Vector Solver: <span style={{ color: '#a855f7' }}>cross(u, v)</span> or <span style={{ color: '#10b981' }}>dot(u, v)</span><br />
+          • Surface Spanner: <span style={{ color: '#ef4444' }}>plane(u, v)</span><br />
+          • Angle Between Vectors: <span style={{ color: '#84cc16' }}>angle(u, v)</span><br />
+          • Named Plane (for intersecting): <span style={{ color: '#06b6d4' }}>p1 = plane(u, v)</span><br />
+          • Line Through Two Points: <span style={{ color: '#f97316' }}>L1 = line(P, Q)</span><br />
+          • Intersection (auto-detects type): <span style={{ color: '#f43f5e' }}>intersect(p1, p2)</span><br />
+          • Results shown as <span style={{ color: '#eab308' }}>r = a + λb</span> in i, j, k form
+        </div>
+      </div>
+
+      {/* RIGHT VIEWPORT MATRIX CONTAINER */}
+      <div style={{ flex: 1, position: 'relative' }}>
+        <Canvas
+          camera={dimensions === '3D' ? { position: [5, 5, 5], fov: 45 } : { position: [0, 0, 8], fov: 45 }}
+          key={dimensions}
+        >
+          <color attach="background" args={[t.sceneBg]} />
+          <ambientLight intensity={0.6} />
+          <directionalLight position={[5, 10, 5]} intensity={0.8} />
+          <OrbitControls enableDamping enableRotate={dimensions === '3D'} enablePan={true} />
+
+          <Grid
+            position={[0, -0.01, 0]}
+            args={[15, 15]}
+            cellSize={1}
+            cellThickness={0.8}
+            cellColor={t.gridCell}
+            sectionColor={t.gridSection}
+            sectionThickness={1.2}
+            infiniteGrid
+            fadeDistance={12}
+          />
+          <axesHelper args={[6]} />
+
+          {/* Map through parsed environment data array loops dynamically */}
+          {environment.renders.map((render) => {
+            if (render.type === 'vector') {
+              return (
+                <group key={render.id}>
+                  <VectorArrow end={render.coords} color={render.color} visible={render.visible} />
+                  {render.visible && !render.name?.includes('(') && (
+                    <SceneLabel position={render.coords} text={render.name} color={render.color} />
+                  )}
+                </group>
+              )
+            }
+            if (render.type === 'plane') {
+              return <SpannedPlane key={render.id} vec1={render.vec1} vec2={render.vec2} color={render.color} visible={render.visible} />
+            }
+            if (render.type === 'line') {
+              return (
+                <group key={render.id}>
+                  <InfiniteLine point={render.point} dir={render.dir} color={render.color} visible={render.visible} />
+                  {render.visible && <SceneLabel position={render.point} text={render.name} color={render.color} />}
+                </group>
+              )
+            }
+            if (render.type === 'intersectionLine') {
+              return <InfiniteLine key={render.id} point={render.point} dir={render.dir} color={render.color} visible={render.visible} length={14} />
+            }
+            if (render.type === 'intersectionPoint') {
+              return (
+                <group key={render.id}>
+                  <IntersectionPoint point={render.point} color={render.color} visible={render.visible} />
+                  {render.visible && <SceneLabel position={render.point} text="intersection" color={render.color} />}
+                </group>
+              )
+            }
+            return null
+          })}
+        </Canvas>
+      </div>
+
+    </div>
+  )
+}
+
+#
